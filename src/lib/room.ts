@@ -29,31 +29,85 @@ export class ChatRoom extends DurableObject {
 	// Were we playing before the waitlock engaged? Determines whether we auto-resume.
 	private preLockWasPlaying = false;
 
+	// ---- Hibernation state restoration ----
+	// After hibernation the constructor re-runs and all in-memory state is lost.
+	// We lazily restore `currentPlayback` from persistent storage on first use.
+	private _initialized = false;
+
+	// ---- Storage maintenance ----
+	// Counter used to trigger periodic old-message cleanup.
+	private messageCount = 0;
+
 	constructor(ctx: DurableObjectState, env: any) {
 		super(ctx, env);
 		this.storage = ctx.storage;
 	}
+
+	// ============== Hibernation helpers ==============
+
+	/**
+	 * Restores authoritative playback state from persistent storage.
+	 * Must be awaited at the top of every public handler so that state is
+	 * correct even after the DO was evicted and re-instantiated.
+	 */
+	private async ensureInitialized(): Promise<void> {
+		if (this._initialized) return;
+		this._initialized = true;
+		const saved = await this.storage.get<PlaybackState>('__playback');
+		if (saved) this.currentPlayback = saved;
+	}
+
+	/**
+	 * Sets authoritative playback state in memory AND schedules a
+	 * persistent write so the value survives hibernation.
+	 */
+	private updatePlayback(state: PlaybackState): void {
+		this.currentPlayback = state;
+		this.ctx.waitUntil(this.storage.put('__playback', state));
+	}
+
+	// ============== Storage maintenance ==============
+
+	/**
+	 * Trims persistent message history to the most recent `maxMessages` entries.
+	 * Keys are ISO date strings which sort chronologically.
+	 */
+	private async trimStorage(maxMessages: number = 500): Promise<void> {
+		// List the oldest keys first (alphabetical = chronological).
+		const all = await this.storage.list({ limit: maxMessages + 1 });
+		if (all.size <= maxMessages) return;
+		const keys = [...all.keys()].sort();
+		const excess = keys.slice(0, all.size - maxMessages);
+		await Promise.all(excess.map((k) => this.storage.delete(k)));
+	}
+
+	// ============== Fetch ==============
 
 	fetch(request: Request): Response | Promise<Response> {
 		const url = new URL(request.url);
 		if (url.pathname === '/websocket') {
 			const pair = new WebSocketPair();
 			this.ctx.acceptWebSocket(pair[1]);
-
 			const init: SessionAttachment = { blockedMessages: [] };
 			pair[1].serializeAttachment(init);
-
 			this.ctx.waitUntil(this.loadHistoryAndSend(pair[1]));
-
 			return new Response(null, { status: 101, webSocket: pair[0] });
 		}
 		return new Response('Not found', { status: 404 });
 	}
 
 	private async loadHistoryAndSend(ws: WebSocket): Promise<void> {
+		await this.ensureInitialized();
+
+		// If the client already sent a "join" before this background task
+		// completed (race condition), the name is set and backlog is stale —
+		// skip it.  The client already received history via the join handler.
+		const attachment = ws.deserializeAttachment() as SessionAttachment;
+		if (attachment.name) return;
+
 		const stored = await this.storage.list({ reverse: true, limit: 50 });
 		const backlog = [...stored.values()].reverse() as string[];
-		const attachment = ws.deserializeAttachment() as SessionAttachment;
+
 		attachment.blockedMessages = backlog;
 
 		for (const other of this.ctx.getWebSockets()) {
@@ -91,9 +145,12 @@ export class ChatRoom extends DurableObject {
 		ws.serializeAttachment(attachment);
 	}
 
-	async webSocketMessage(ws: WebSocket, raw: string): Promise<void> {
-		const attachment = ws.deserializeAttachment() as SessionAttachment;
+	// ============== WebSocket messages ==============
 
+	async webSocketMessage(ws: WebSocket, raw: string): Promise<void> {
+		await this.ensureInitialized();
+
+		const attachment = ws.deserializeAttachment() as SessionAttachment;
 		let data: any;
 		try {
 			data = JSON.parse(raw);
@@ -108,11 +165,9 @@ export class ChatRoom extends DurableObject {
 			attachment.clientId = data.clientId || crypto.randomUUID();
 			attachment.buffering = false;
 			attachment.lastPosition = 0;
-
 			for (const m of attachment.blockedMessages) ws.send(m);
 			attachment.blockedMessages = [];
 			ws.serializeAttachment(attachment);
-
 			this.broadcast({ type: 'join', user: attachment.name, timestamp: Date.now() }, ws);
 			this.updateUsers();
 			return;
@@ -138,6 +193,7 @@ export class ChatRoom extends DurableObject {
 			this.onBufferStateChanged();
 			return;
 		}
+
 		if (data.type === 'buffer_end') {
 			if (typeof data.position === 'number') attachment.lastPosition = data.position;
 			attachment.buffering = false;
@@ -145,6 +201,7 @@ export class ChatRoom extends DurableObject {
 			this.onBufferStateChanged();
 			return;
 		}
+
 		if (data.type === 'position_report') {
 			// Periodic position from clients (sent during waitlock so the server
 			// can pick the slowest position on release).
@@ -172,7 +229,7 @@ export class ChatRoom extends DurableObject {
 			this.lastTimestamp = timestamp;
 
 			if (action === 'play' || action === 'pause') {
-				this.currentPlayback = { action, position, timestamp };
+				this.updatePlayback({ action, position, timestamp });
 			}
 
 			// Update sender's known position from any playback message.
@@ -208,6 +265,10 @@ export class ChatRoom extends DurableObject {
 			});
 			this.broadcast(msg);
 			await this.storage.put(new Date(wallTs).toISOString(), msg);
+			this.messageCount++;
+			if (this.messageCount % 50 === 0) {
+				this.ctx.waitUntil(this.trimStorage());
+			}
 			return;
 		}
 
@@ -221,6 +282,10 @@ export class ChatRoom extends DurableObject {
 		this.broadcast(payload);
 		if (data.type !== 'stream') {
 			await this.storage.put(new Date(wallTs).toISOString(), payload);
+			this.messageCount++;
+			if (this.messageCount % 50 === 0) {
+				this.ctx.waitUntil(this.trimStorage());
+			}
 		}
 	}
 
@@ -242,17 +307,15 @@ export class ChatRoom extends DurableObject {
 		if (!wasLocked && nowLocked) {
 			// LOCK ENGAGE: remember whether we were playing, force-pause everyone.
 			this.preLockWasPlaying = this.currentPlayback.action === 'play';
-
 			// Record authoritative pause state at "now-projected" position.
 			if (this.preLockWasPlaying) {
 				const elapsedSec = (performance.now() - this.currentPlayback.timestamp) / 1000;
-				this.currentPlayback = {
+				this.updatePlayback({
 					action: 'pause',
 					position: this.currentPlayback.position + elapsedSec,
 					timestamp: performance.now(),
-				};
+				});
 			}
-
 			this.broadcast(
 				JSON.stringify({
 					type: 'waitlock',
@@ -293,7 +356,7 @@ export class ChatRoom extends DurableObject {
 				const now = performance.now();
 				const timestamp = Math.max(now + PLAYBACK_DELAY_MS, this.lastTimestamp + 1);
 				this.lastTimestamp = timestamp;
-				this.currentPlayback = { action: 'play', position: minPos, timestamp };
+				this.updatePlayback({ action: 'play', position: minPos, timestamp });
 				this.broadcast(
 					JSON.stringify({
 						type: 'playback',
@@ -309,7 +372,7 @@ export class ChatRoom extends DurableObject {
 				const now = performance.now();
 				const timestamp = Math.max(now + PLAYBACK_DELAY_MS, this.lastTimestamp + 1);
 				this.lastTimestamp = timestamp;
-				this.currentPlayback = { action: 'pause', position: minPos, timestamp };
+				this.updatePlayback({ action: 'pause', position: minPos, timestamp });
 				this.broadcast(
 					JSON.stringify({
 						type: 'playback',
@@ -320,7 +383,6 @@ export class ChatRoom extends DurableObject {
 					}),
 				);
 			}
-
 			this.preLockWasPlaying = false;
 		}
 	}
@@ -328,6 +390,7 @@ export class ChatRoom extends DurableObject {
 	// ============== Lifecycle ==============
 
 	async webSocketClose(ws: WebSocket): Promise<void> {
+		await this.ensureInitialized();
 		const att = ws.deserializeAttachment() as SessionAttachment;
 		if (att.name) {
 			this.broadcast({ type: 'leave', user: att.name, timestamp: Date.now() });
@@ -349,8 +412,12 @@ export class ChatRoom extends DurableObject {
 			if (att.name) {
 				ws.send(raw);
 			} else {
-				att.blockedMessages.push(raw);
-				ws.serializeAttachment(att);
+				// Cap blocked messages for unauthenticated sockets to prevent
+				// unbounded memory growth if a client connects but never sends "join".
+				if (att.blockedMessages.length < 200) {
+					att.blockedMessages.push(raw);
+					ws.serializeAttachment(att);
+				}
 			}
 		}
 	}
